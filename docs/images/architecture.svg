@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title desc">
+  <title id="title">Duotongfa architecture</title><desc id="desc">A local gateway routes resources between local LLM clients and ComfyUI rendering.</desc>
+  <defs><style>.bg{fill:#0d1117}.box{fill:#161b22;stroke:#58a6ff;stroke-width:2}.core{fill:#1f2937;stroke:#f2cc60;stroke-width:3}.t{fill:#f0f6fc;font:22px system-ui}.s{fill:#8b949e;font:16px system-ui}.a{stroke:#8b949e;stroke-width:3;fill:none;marker-end:url(#m)}</style><marker id="m" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#8b949e"/></marker></defs>
+  <rect class="bg" width="1200" height="560" rx="24"/>
+  <text class="t" x="50" y="55">多通阀 / Duotongfa — local resource handoff</text>
+  <rect class="box" x="55" y="130" width="260" height="105" rx="16"/><text class="t" x="85" y="175">ComfyTV / clients</text><text class="s" x="85" y="205">OpenAI-compatible traffic</text>
+  <rect class="box" x="55" y="340" width="260" height="105" rx="16"/><text class="t" x="85" y="385">Render integration</text><text class="s" x="85" y="415">prepare · commit · release</text>
+  <rect class="core" x="425" y="205" width="350" height="155" rx="20"/><text class="t" x="500" y="255">Duotongfa gateway</text><text class="s" x="505" y="290">state machine · cache · guard</text><text class="s" x="530" y="320">127.0.0.1:1234</text>
+  <rect class="box" x="885" y="105" width="260" height="105" rx="16"/><text class="t" x="930" y="150">Local LLM</text><text class="s" x="925" y="180">LM Studio / Ollama / …</text>
+  <rect class="box" x="885" y="350" width="260" height="105" rx="16"/><text class="t" x="960" y="395">ComfyUI</text><text class="s" x="925" y="425">prompt execution truth</text>
+  <path class="a" d="M315 182 L425 245"/><path class="a" d="M315 392 L425 320"/><path class="a" d="M775 245 L885 175"/><path class="a" d="M885 390 L775 325"/>
+  <text class="s" x="410" y="505">No cloud API keys · no prompts or media persisted · loopback by default</text>
+</svg>

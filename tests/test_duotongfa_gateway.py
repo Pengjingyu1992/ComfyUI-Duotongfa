@@ -1,0 +1,452 @@
+from __future__ import annotations
+
+import json
+import threading
+import urllib.error
+import urllib.request
+from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+import duotongfa_gateway as gateway
+import duotongfa_runtime as runtime
+
+
+def _config(tmp_path, **changes):
+    base = runtime.GatewayConfig(
+        listen_host="127.0.0.1",
+        listen_port=0,
+        upstream_url="http://127.0.0.1:65530",
+        provider="custom",
+        idle_seconds=300,
+        start_timeout_seconds=2,
+        stop_timeout_seconds=2,
+        render_watchdog_seconds=120,
+        monitor_interval_seconds=1,
+        state_dir=tmp_path,
+        allow_external_stop=False,
+        resume_policy="on-demand",
+        force_app_exit=False,
+        require_process_exit=False,
+        minimum_available_mb=0,
+        stable_release_checks=1,
+        max_body_bytes=1024 * 1024,
+        control_token="",
+        comfyui_url="http://127.0.0.1:65531",
+        start_command=(),
+        stop_command=(),
+    )
+    return replace(base, **changes)
+
+
+class FakeAdapter:
+    def __init__(self, healthy=True):
+        self.healthy_value = healthy
+        self.starts = 0
+        self.stops = 0
+
+    def healthy(self):
+        return self.healthy_value
+
+    def processes(self):
+        return []
+
+    def start(self):
+        self.starts += 1
+        self.healthy_value = True
+        return {"ok": True, "started": True, "ownership": "gateway"}
+
+    def stop(self, *, owned):
+        self.stops += 1
+        self.healthy_value = False
+        return {"ok": True, "owned": owned}
+
+    def status(self):
+        return {
+            "provider": "fake",
+            "healthy": self.healthy_value,
+            "port_open": self.healthy_value,
+            "processes": [],
+        }
+
+
+def test_default_state_dir_follows_each_platform(tmp_path):
+    assert runtime.default_state_dir(home=tmp_path, env={}, system="Darwin") == (
+        tmp_path / "Library" / "Application Support" / "duotongfa"
+    )
+    assert runtime.default_state_dir(home=tmp_path, env={}, system="Linux") == (
+        tmp_path / ".local" / "state" / "duotongfa"
+    )
+    assert runtime.default_state_dir(
+        home=tmp_path,
+        env={"LOCALAPPDATA": str(tmp_path / "Local")},
+        system="Windows",
+    ) == tmp_path / "Local" / "duotongfa"
+
+
+def test_config_accepts_legacy_ports_but_exposes_portable_names(tmp_path):
+    config = runtime.GatewayConfig.from_env(
+        {
+            "GW_PORT": "2468",
+            "LM_PORT": "2469",
+            "DUOTONGFA_STATE_DIR": str(tmp_path),
+        },
+        system="Linux",
+    )
+    assert config.listen_port == 2468
+    assert config.upstream_url == "http://127.0.0.1:2469"
+    assert config.state_dir == tmp_path
+
+
+def test_config_rejects_cloud_or_unknown_provider(tmp_path):
+    with pytest.raises(ValueError, match="DUOTONGFA_PROVIDER"):
+        runtime.GatewayConfig.from_env(
+            {
+                "DUOTONGFA_PROVIDER": "cloud-api",
+                "DUOTONGFA_STATE_DIR": str(tmp_path),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("system", "relative"),
+    [
+        ("Darwin", ".lmstudio/bin/lms"),
+        ("Linux", ".lmstudio/bin/lms"),
+        ("Windows", ".lmstudio/bin/lms.exe"),
+    ],
+)
+def test_lms_discovery_is_cross_platform(tmp_path, system, relative):
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_text("stub", encoding="utf-8")
+    target.chmod(0o755)
+    found = runtime.resolve_lms_path(
+        env={}, home=tmp_path, system=system, which=lambda _name: None
+    )
+    assert found == target
+
+
+def test_json_command_form_is_portable():
+    assert runtime.configured_command(
+        {"DUOTONGFA_START_COMMAND": '["llama-server", "--port", "8080"]'},
+        "DUOTONGFA_START_COMMAND",
+        system="Windows",
+    ) == ["llama-server", "--port", "8080"]
+
+
+@pytest.mark.parametrize(
+    ("upstream", "request_path", "expected"),
+    [
+        ("http://127.0.0.1:1235", "/v1/models", "http://127.0.0.1:1235/v1/models"),
+        ("http://127.0.0.1:1235/v1", "/v1/models", "http://127.0.0.1:1235/v1/models"),
+        (
+            "http://127.0.0.1:1235/v1",
+            "/v1/chat/completions?stream=true",
+            "http://127.0.0.1:1235/v1/chat/completions?stream=true",
+        ),
+    ],
+)
+def test_upstream_join_accepts_root_or_v1_base(upstream, request_path, expected):
+    assert gateway._upstream_request_url(upstream, request_path) == expected
+
+
+def test_atomic_json_is_safe_for_concurrent_state_writes(tmp_path):
+    target = tmp_path / "state.json"
+
+    def write(index):
+        gateway._atomic_json(target, {"index": index})
+
+    threads = [threading.Thread(target=write, args=(index,)) for index in range(80)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert json.loads(target.read_text(encoding="utf-8"))["index"] in range(80)
+    assert not list(tmp_path.glob(".state.json.*.tmp"))
+
+
+def test_lm_studio_stop_treats_closed_backend_as_off_without_claiming_gui(tmp_path, monkeypatch):
+    config = _config(
+        tmp_path,
+        provider="lm-studio",
+        upstream_url="http://127.0.0.1:65529",
+        require_process_exit=False,
+    )
+    adapter = runtime.LMStudioAdapter(config, env={})
+    monkeypatch.setattr(adapter, "healthy", lambda: False)
+    monkeypatch.setattr(adapter, "processes", lambda: [{"name": "LM Studio"}])
+    assert adapter.stop(owned=False) == {"ok": True, "already_off": True}
+
+
+def test_lm_studio_process_filter_does_not_count_gateway_or_proxy(monkeypatch):
+    monkeypatch.setattr(runtime, "_process_rows", lambda _system=None: iter([
+        (100, "/usr/bin/python lmstudio_gateway.py"),
+        (101, "/usr/bin/python claude-lmstudio-proxy.py"),
+        (102, "/Applications/LM Studio.app/Contents/MacOS/LM Studio"),
+        (103, "/home/tester/.lmstudio/.internal/utils/node worker.js"),
+        (104, "/usr/bin/llmster --serve"),
+        (105, "/bin/zsh -lc rg '/LM Studio.app/|/.lmstudio/.internal/'"),
+    ]))
+    found = runtime.lm_studio_processes(system="Darwin")
+    assert [item["pid"] for item in found] == [102, 103, 104]
+
+
+def test_lm_studio_stop_uses_server_stop_without_unload_wakeup(tmp_path, monkeypatch):
+    config = _config(
+        tmp_path,
+        provider="lm-studio",
+        upstream_url="http://127.0.0.1:65528",
+        allow_external_stop=True,
+        force_app_exit=True,
+    )
+    adapter = runtime.LMStudioAdapter(config, env={})
+    calls = []
+
+    def fake_lms(*args, timeout=60):
+        calls.append(args)
+        return runtime.subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(adapter, "_lms", fake_lms)
+    monkeypatch.setattr(adapter, "healthy", lambda: False)
+    monkeypatch.setattr(runtime, "port_is_open", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(adapter, "_quit_app", lambda: {"attempted": True})
+    monkeypatch.setattr(adapter, "processes", lambda: [])
+    result = adapter.stop(owned=False)
+    assert result["ok"] is True
+    assert calls == [("server", "stop"), ("daemon", "down")]
+
+
+def test_render_handoff_stops_backend_and_uses_one_token(tmp_path):
+    adapter = FakeAdapter(healthy=True)
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+
+    prepared = coordinator.control({
+        "action": "render.prepare",
+        "job_id": "job-1",
+        "owner": "test",
+        "workflow": "image",
+    })
+    assert prepared["ok"] is True
+    assert prepared["state"] == "PREPARE_RENDER"
+    assert adapter.stops == 1
+    assert coordinator.render_lock()["backend_was_on"] is True
+
+    committed = coordinator.control({
+        "action": "render.commit",
+        "token": prepared["token"],
+        "prompt_id": "prompt-1",
+    })
+    assert committed["state"] == "RENDERING"
+
+    released = coordinator.control({
+        "action": "render.release",
+        "token": prepared["token"],
+    })
+    assert released["state"] == "IDLE"
+    assert adapter.starts == 0
+    assert coordinator.render_lock() is None
+
+
+def test_status_redacts_render_capability_token(tmp_path):
+    adapter = FakeAdapter(healthy=True)
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+    prepared = coordinator.prepare_render({"job_id": "private-job"})
+    assert prepared["token"].startswith("render|")
+    assert coordinator.status()["render_lock"]["token"] == "configured"
+
+
+def test_duplicate_prepare_waits_until_shutdown_is_verified(tmp_path):
+    class SlowAdapter(FakeAdapter):
+        def stop(self, *, owned):
+            self.stops += 1
+            import time
+            time.sleep(0.15)
+            self.healthy_value = False
+            return {"ok": True, "owned": owned}
+
+    adapter = SlowAdapter(True)
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+    results = []
+    errors = []
+
+    def prepare():
+        try:
+            results.append(coordinator.prepare_render({"job_id": "same-job"}))
+        except Exception as exc:
+            errors.append(str(exc))
+
+    threads = [threading.Thread(target=prepare) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors
+    assert len(results) == 2
+    assert all(item.get("ready") or item.get("shutdown") for item in results)
+    assert adapter.stops == 1
+
+
+def test_commit_and_release_are_blocked_during_prepare(tmp_path):
+    adapter = FakeAdapter(True)
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+    coordinator._render_lock = {
+        "token": "pending",
+        "job_id": "pending-job",
+        "state": "PREPARE_RENDER",
+        "created_at": 0,
+        "updated_at": 0,
+    }
+    with pytest.raises(RuntimeError, match="still in progress"):
+        coordinator.commit_render({"token": "pending"})
+    with pytest.raises(RuntimeError, match="still in progress"):
+        coordinator.release_render({"token": "pending"})
+
+
+def test_prepare_does_not_return_a_token_after_watchdog_cancels_it(tmp_path, monkeypatch):
+    adapter = FakeAdapter(True)
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+
+    def cancel_during_stop(*, reason):
+        with coordinator._render_condition:
+            coordinator._render_lock = None
+            coordinator._render_condition.notify_all()
+        return {"ok": True, "already_off": True, "reason": reason}
+
+    monkeypatch.setattr(coordinator, "stop_backend", cancel_during_stop)
+    with pytest.raises(RuntimeError, match="cancelled"):
+        coordinator.prepare_render({"job_id": "cancelled-job"})
+    assert coordinator.render_lock() is None
+
+
+def test_restore_policy_restarts_only_when_backend_was_previously_on(tmp_path):
+    config = _config(tmp_path, resume_policy="restore")
+    adapter = FakeAdapter(healthy=True)
+    coordinator = gateway.Coordinator(config, adapter=adapter)
+    prepared = coordinator.prepare_render({"job_id": "job-restore"})
+    released = coordinator.release_render({"token": prepared["token"]})
+    assert released["resume"]["ok"] is True
+    assert adapter.starts == 1
+
+
+def test_recovered_state_never_recovers_process_ownership(tmp_path):
+    state = {
+        "started_by_gateway": True,
+        "render_lock": None,
+    }
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=FakeAdapter(False))
+    assert coordinator.status()["started_by_gateway"] is False
+
+
+def test_watchdog_releases_stale_lock_without_starting_model(tmp_path, monkeypatch):
+    adapter = FakeAdapter(True)
+    config = _config(tmp_path, render_watchdog_seconds=30)
+    coordinator = gateway.Coordinator(config, adapter=adapter)
+    prepared = coordinator.prepare_render({"job_id": "job-stale"})
+    coordinator.commit_render({"token": prepared["token"], "prompt_id": "p"})
+    with coordinator._render_lock_guard:
+        coordinator._render_lock["updated_at"] -= 60
+    monkeypatch.setattr(coordinator, "_prompt_terminal", lambda _prompt_id: None)
+    coordinator.monitor_once()
+    assert coordinator.render_lock() is None
+    assert coordinator.status()["metrics"]["watchdog_releases"] == 1
+    assert adapter.starts == 0
+
+
+def test_render_monitor_reasserts_shutdown_after_unexpected_wakeup(tmp_path, monkeypatch):
+    adapter = FakeAdapter(True)
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+    prepared = coordinator.prepare_render({"job_id": "job-rewake"})
+    assert coordinator.render_lock()["release_verified_at"] > 0
+    adapter.healthy_value = True
+    monkeypatch.setattr(coordinator, "_prompt_terminal", lambda _prompt_id: None)
+    coordinator.monitor_once()
+    assert adapter.stops == 2
+    assert adapter.healthy_value is False
+    assert coordinator.render_lock()["token"] == prepared["token"]
+    assert coordinator.status()["metrics"]["unexpected_wakeups"] == 1
+
+
+class _UpstreamHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            body = b'{"data":[{"id":"local-model"}]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def _start_server(server):
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_gateway_has_one_control_path_and_serves_cached_models_during_render(tmp_path):
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _UpstreamHandler)
+    _start_server(upstream)
+    upstream_port = upstream.server_address[1]
+    config = _config(
+        tmp_path,
+        upstream_url=f"http://127.0.0.1:{upstream_port}",
+    )
+    adapter = FakeAdapter(True)
+    coordinator = gateway.Coordinator(config, adapter=adapter)
+    server = gateway.GatewayServer(("127.0.0.1", 0), gateway.Handler, coordinator)
+    _start_server(server)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(f"{base}/v1/models", timeout=3) as response:
+            assert json.loads(response.read())["data"][0]["id"] == "local-model"
+        with urllib.request.urlopen(f"{base}{gateway.CONTROL_PATH}", timeout=3) as response:
+            status = json.loads(response.read())
+        assert status["control_path"] == "/__duotongfa"
+
+        request = urllib.request.Request(
+            f"{base}{gateway.CONTROL_PATH}",
+            data=json.dumps({"action": "render.prepare", "job_id": "http-job"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            prepared = json.loads(response.read())
+        with urllib.request.urlopen(f"{base}/v1/models", timeout=3) as response:
+            assert response.headers["X-Duotongfa-State"] == "RENDERING"
+            assert json.loads(response.read())["data"][0]["id"] == "local-model"
+
+        blocked = urllib.request.Request(
+            f"{base}/v1/chat/completions",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(blocked, timeout=3)
+        assert raised.value.code == 423
+
+        release = urllib.request.Request(
+            f"{base}{gateway.CONTROL_PATH}",
+            data=json.dumps({
+                "action": "render.release",
+                "token": prepared["token"],
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(release, timeout=3) as response:
+            assert json.loads(response.read())["state"] == "IDLE"
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.shutdown()
+        upstream.server_close()

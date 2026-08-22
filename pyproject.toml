@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui-duotongfa"
+version = "0.2.0"
+description = "Local resource handoff gateway for ComfyUI and local LLM runtimes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "Pengjingyu1992" }]
+keywords = ["ComfyUI", "ComfyTV", "LM Studio", "local LLM", "Apple Silicon"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Pengjingyu1992/ComfyUI-Duotongfa"
+Issues = "https://github.com/Pengjingyu1992/ComfyUI-Duotongfa/issues"
+
+[tool.setuptools]
+py-modules = ["duotongfa_gateway", "duotongfa_runtime"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

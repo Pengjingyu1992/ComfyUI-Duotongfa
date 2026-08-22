@@ -1,0 +1,22 @@
+name: Bug report / 兼容性反馈
+description: Report a redacted compatibility or lifecycle problem
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include keys, prompts, private media, model files, or personal paths. 请先删除隐私信息。"
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, CPU/GPU, RAM/VRAM, Python, ComfyUI, backend and model quantization.
+    validations: {required: true}
+  - type: textarea
+    id: steps
+    attributes: {label: Reproduction steps}
+    validations: {required: true}
+  - type: textarea
+    id: expected
+    attributes: {label: Expected behavior}
+  - type: textarea
+    id: actual
+    attributes: {label: Actual behavior and redacted diagnostics}
