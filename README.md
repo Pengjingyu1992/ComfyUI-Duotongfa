@@ -4,6 +4,8 @@
 
 Duotongfa is a local resource handoff gateway for machines where ComfyUI and a local LLM share GPU memory or unified memory. It gives the LLM runtime and the image renderer one lifecycle coordinator, so a render starts only after the LLM has actually released resources.
 
+Current release: **0.2.4**.
+
 ![Duotongfa architecture](docs/images/architecture.svg)
 
 ## Why it exists
@@ -23,6 +25,7 @@ The name and control idea were inspired by multi-way thermal valves and Tesla's 
 - Proxies one OpenAI-compatible local endpoint.
 - Coordinates `prepare → commit → heartbeat → release` around ComfyUI rendering.
 - Blocks LLM forwarding during render, while serving a read-only model cache.
+- Serializes cold model loads and model switches, with optional request limits and LM Studio loading profiles.
 - Verifies backend port, processes, and memory stability before rendering.
 - Watches ComfyUI `prompt_id` state and uses a watchdog only as a fallback.
 - Supports LM Studio, Ollama, llama.cpp, vLLM, llama-swap, and custom local runtimes.

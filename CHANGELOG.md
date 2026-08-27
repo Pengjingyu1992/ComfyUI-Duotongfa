@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.4
+
+- Added model-aware cold-load and model-switch coordination while preserving warm same-model concurrency.
+- Added optional request concurrency limits and bounded LM Studio context, parallel-slot, and model-TTL profiles.
+- Added promptless render recovery based on observed ComfyUI queue drain plus a configurable orphan grace period.
+- Added LM Studio `llama-server` worker detection and installer flags for the new runtime settings.
+- Preserved the 0.2.1 cold `/models` cache, forced generation-model policy, backend retry, prompt-state checks, and public render-token redaction.
+
 ## 0.2.1
 
 - Added cold-state model discovery from the persisted cache without waking the local backend.

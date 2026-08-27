@@ -14,6 +14,17 @@ cd ComfyUI-Duotongfa
 python tools/install_duotongfa.py install --start
 ```
 
+Version 0.2.4 options can be persisted in the user service during installation, for example:
+
+```bash
+python tools/install_duotongfa.py install --start \
+  --max-concurrent-requests 2 \
+  --lm-studio-context-length 32768 \
+  --lm-studio-parallel 2 \
+  --lm-studio-model-ttl-seconds 360 \
+  --force-model bot-model
+```
+
 The installer copies the two dependency-free runtime files to a stable per-user data folder, then creates:
 
 - macOS: a user LaunchAgent

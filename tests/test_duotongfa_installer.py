@@ -22,6 +22,12 @@ def _args(**changes):
         "upstream": "http://127.0.0.1:1235",
         "idle_seconds": 300,
         "resume_policy": "on-demand",
+        "orphan_render_grace_seconds": 60,
+        "max_concurrent_requests": 0,
+        "lm_studio_context_length": 0,
+        "lm_studio_parallel": 0,
+        "lm_studio_model_ttl_seconds": 0,
+        "force_model": "",
         "force_app_exit": False,
         "allow_external_stop": False,
         "require_process_exit": False,
@@ -43,6 +49,23 @@ def test_linux_service_has_user_restart_policy(tmp_path):
     assert "Restart=on-failure" in text
     assert "DUOTONGFA_PROVIDER=lm-studio" in text
     assert "WantedBy=default.target" in text
+
+
+def test_service_environment_includes_024_model_profile_and_force_policy():
+    values = installer._service_environment(
+        _args(
+            max_concurrent_requests=2,
+            lm_studio_context_length=32768,
+            lm_studio_parallel=2,
+            lm_studio_model_ttl_seconds=360,
+            force_model="bot-model",
+        )
+    )
+    assert values["DUOTONGFA_MAX_CONCURRENT_REQUESTS"] == "2"
+    assert values["DUOTONGFA_LM_STUDIO_CONTEXT_LENGTH"] == "32768"
+    assert values["DUOTONGFA_LM_STUDIO_PARALLEL"] == "2"
+    assert values["DUOTONGFA_LM_STUDIO_MODEL_TTL_SECONDS"] == "360"
+    assert values["DUOTONGFA_FORCE_MODEL"] == "bot-model"
 
 
 def test_windows_startup_uses_pythonw_when_available(tmp_path):

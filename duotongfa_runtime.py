@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 
 PROJECT_ID = "duotongfa"
 PROJECT_NAME = "多通阀"
-RUNTIME_VERSION = "0.2.1"
+RUNTIME_VERSION = "0.2.4"
 SUPPORTED_PROVIDERS = (
     "lm-studio",
     "ollama",
@@ -295,6 +295,10 @@ def lm_studio_processes(*, system: Optional[str] = None) -> List[Dict[str, Any]]
         matched = (
             normalized_command.startswith("/applications/lm studio.app/")
             or "/.lmstudio/.internal/" in normalized_executable
+            or (
+                "/.lmstudio/extensions/backends/" in normalized_executable
+                and executable == "llama-server"
+            )
             or "llmster" in executable
         )
         if current == "windows":
@@ -474,6 +478,11 @@ class GatewayConfig:
     start_command: Tuple[str, ...]
     stop_command: Tuple[str, ...]
     forced_model: str = ""
+    orphan_render_grace_seconds: float = 60.0
+    max_concurrent_requests: int = 0
+    lm_studio_context_length: int = 0
+    lm_studio_parallel: int = 0
+    lm_studio_model_ttl_seconds: int = 0
 
     @classmethod
     def from_env(
@@ -523,6 +532,22 @@ class GatewayConfig:
             start_command=tuple(start),
             stop_command=tuple(stop),
             forced_model=str(values.get("DUOTONGFA_FORCE_MODEL", "")).strip(),
+            orphan_render_grace_seconds=max(
+                15.0,
+                _env_float(values, "DUOTONGFA_ORPHAN_RENDER_GRACE_SECONDS", 60.0),
+            ),
+            max_concurrent_requests=max(
+                0, _env_int(values, "DUOTONGFA_MAX_CONCURRENT_REQUESTS", 0)
+            ),
+            lm_studio_context_length=max(
+                0, _env_int(values, "DUOTONGFA_LM_STUDIO_CONTEXT_LENGTH", 0)
+            ),
+            lm_studio_parallel=max(
+                0, _env_int(values, "DUOTONGFA_LM_STUDIO_PARALLEL", 0)
+            ),
+            lm_studio_model_ttl_seconds=max(
+                0, _env_int(values, "DUOTONGFA_LM_STUDIO_MODEL_TTL_SECONDS", 0)
+            ),
         )
 
     def public_dict(self) -> Dict[str, Any]:
@@ -636,6 +661,93 @@ class LMStudioAdapter(BackendAdapter):
 
     def processes(self) -> List[Dict[str, Any]]:
         return lm_studio_processes()
+
+    def _loaded_models(self) -> List[Dict[str, Any]]:
+        result = self._lms("ps", "--json", timeout=30.0)
+        if result.returncode != 0:
+            raise RuntimeError(
+                _completed_detail(result) or "Could not inspect loaded LM Studio models"
+            )
+        try:
+            payload = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("LM Studio returned invalid model status JSON") from exc
+        if isinstance(payload, dict):
+            payload = payload.get("models") or payload.get("data") or []
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    def prepare_model(self, model: str) -> Dict[str, Any]:
+        """Load one model with the configured bounded context/concurrency profile."""
+        model = str(model or "").strip()
+        if not model:
+            return {"ok": True, "configured": False, "reason": "no_model"}
+        context_length = self.config.lm_studio_context_length
+        parallel = self.config.lm_studio_parallel
+        ttl_seconds = self.config.lm_studio_model_ttl_seconds
+        if not any((context_length, parallel, ttl_seconds)):
+            return {"ok": True, "configured": False, "reason": "no_profile"}
+
+        loaded = self._loaded_models()
+        selected = next(
+            (
+                item
+                for item in loaded
+                if model
+                in {
+                    str(item.get("identifier") or "").strip(),
+                    str(item.get("modelKey") or "").strip(),
+                }
+            ),
+            None,
+        )
+        matches = bool(selected)
+        if selected and context_length:
+            matches = matches and int(selected.get("contextLength") or 0) == context_length
+        if selected and parallel:
+            matches = matches and int(selected.get("parallel") or 0) == parallel
+        if selected and ttl_seconds:
+            matches = matches and int(selected.get("ttlMs") or 0) == ttl_seconds * 1000
+        if matches and len(loaded) == 1:
+            return {
+                "ok": True,
+                "configured": True,
+                "already_loaded": True,
+                "model": model,
+            }
+
+        if loaded:
+            unloaded = self._lms("unload", "--all", timeout=90.0)
+            if unloaded.returncode != 0:
+                raise RuntimeError(
+                    _completed_detail(unloaded)
+                    or "Could not unload the previous LM Studio model"
+                )
+
+        args = ["load", model, "--gpu", "max"]
+        if context_length:
+            args.extend(["--context-length", str(context_length)])
+        if parallel:
+            args.extend(["--parallel", str(parallel)])
+        if ttl_seconds:
+            args.extend(["--ttl", str(ttl_seconds)])
+        args.extend(["--identifier", model, "--yes"])
+        loaded_result = self._lms(*args, timeout=self.config.start_timeout_seconds)
+        if loaded_result.returncode != 0:
+            raise RuntimeError(
+                _completed_detail(loaded_result)
+                or f"Could not load LM Studio model: {model}"
+            )
+        return {
+            "ok": True,
+            "configured": True,
+            "already_loaded": False,
+            "model": model,
+            "context_length": context_length,
+            "parallel": parallel,
+            "ttl_seconds": ttl_seconds,
+        }
 
     def start(self) -> Dict[str, Any]:
         if self.healthy():

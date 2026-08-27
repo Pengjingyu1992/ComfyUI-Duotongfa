@@ -19,6 +19,20 @@ python duotongfa_gateway.py status
 
 渲染期间，模型列表可以使用只读缓存；聊天与 embedding 请求返回 HTTP 423，不会被转发到后端，也不会唤醒模型。
 
+## 模型加载与请求协调
+
+`0.2.4` 会把首次冷加载和模型切换串行化；模型预热完成后，同一模型的请求可以并行执行。以下配置可限制网关总并发，并固定 LM Studio 的模型加载参数：
+
+```bash
+export DUOTONGFA_MAX_CONCURRENT_REQUESTS=2
+export DUOTONGFA_LM_STUDIO_CONTEXT_LENGTH=32768
+export DUOTONGFA_LM_STUDIO_PARALLEL=2
+export DUOTONGFA_LM_STUDIO_MODEL_TTL_SECONDS=360
+export DUOTONGFA_ORPHAN_RENDER_GRACE_SECONDS=60
+```
+
+除无 `prompt_id` 渲染锁的宽限期默认 60 秒外，其余值默认都是 `0`，表示不限或使用后端默认值。无 `prompt_id` 的渲染任务在 ComfyUI 队列被观察到并排空后会自动释放；如果任务从未进入队列，也会在宽限期后解除孤儿锁。
+
 ## 为什么渲染期间卸载模型反而更快
 
 LLM 常驻会和生图模型争用显存或 Apple 统一内存。渲染前卸载模型可以减少资源争用，实际速度和内存收益需要在所用模型与硬件上测量。
@@ -34,7 +48,7 @@ export DUOTONGFA_FORCE_MODEL="your-model-id"
 python duotongfa_gateway.py serve
 ```
 
-网关会覆盖 `/chat/completions`、`/completions` 和 `/responses` 请求中的 `model`，并返回 `X-Duotongfa-Model-Policy: FORCED`。`/embeddings` 不会被改写，因为 embedding 通常需要独立模型。配置为空时完全禁用该策略，恢复由客户端选择模型的通用模式。
+网关会覆盖 `/chat/completions`、`/completions`、`/responses` 和 LM Studio `/api/v1/chat` 请求中的 `model`，并返回 `X-Duotongfa-Model-Policy: FORCED`。`/embeddings` 不会被改写，因为 embedding 通常需要独立模型。配置为空时完全禁用该策略，恢复由客户端选择模型的通用模式。
 
 模型名必须使用 LM Studio `/models` 返回的实际 ID；下载目录名或界面显示名不一定相同。客户端可以继续保存自己的对话历史，因此强制模型或以后更换模型不会另建一份上下文。
 

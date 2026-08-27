@@ -99,6 +99,136 @@ def test_config_accepts_legacy_ports_but_exposes_portable_names(tmp_path):
     assert config.state_dir == tmp_path
 
 
+def test_config_reads_024_request_and_model_profile_settings(tmp_path):
+    config = runtime.GatewayConfig.from_env(
+        {
+            "DUOTONGFA_ORPHAN_RENDER_GRACE_SECONDS": "75",
+            "DUOTONGFA_MAX_CONCURRENT_REQUESTS": "2",
+            "DUOTONGFA_LM_STUDIO_CONTEXT_LENGTH": "32768",
+            "DUOTONGFA_LM_STUDIO_PARALLEL": "2",
+            "DUOTONGFA_LM_STUDIO_MODEL_TTL_SECONDS": "360",
+            "DUOTONGFA_FORCE_MODEL": "bot-model",
+            "DUOTONGFA_STATE_DIR": str(tmp_path),
+        },
+        system="Darwin",
+    )
+    assert config.orphan_render_grace_seconds == 75
+    assert config.max_concurrent_requests == 2
+    assert config.lm_studio_context_length == 32768
+    assert config.lm_studio_parallel == 2
+    assert config.lm_studio_model_ttl_seconds == 360
+    assert config.forced_model == "bot-model"
+
+
+def test_lm_studio_prepare_model_reloads_with_bounded_profile(tmp_path, monkeypatch):
+    config = _config(
+        tmp_path,
+        provider="lm-studio",
+        lm_studio_context_length=32768,
+        lm_studio_parallel=2,
+        lm_studio_model_ttl_seconds=360,
+    )
+    adapter = runtime.LMStudioAdapter(config, env={})
+    calls = []
+
+    def fake_lms(*args, timeout=60):
+        calls.append(args)
+        stdout = ""
+        if args == ("ps", "--json"):
+            stdout = json.dumps(
+                {
+                    "models": [
+                        {
+                            "modelKey": "bot-model",
+                            "identifier": "bot-model",
+                            "contextLength": 131072,
+                            "parallel": 4,
+                            "ttlMs": 300000,
+                        }
+                    ]
+                }
+            )
+        return runtime.subprocess.CompletedProcess(args, 0, stdout, "")
+
+    monkeypatch.setattr(adapter, "_lms", fake_lms)
+    result = adapter.prepare_model("bot-model")
+    assert result["ok"] is True
+    assert calls == [
+        ("ps", "--json"),
+        ("unload", "--all"),
+        (
+            "load",
+            "bot-model",
+            "--gpu",
+            "max",
+            "--context-length",
+            "32768",
+            "--parallel",
+            "2",
+            "--ttl",
+            "360",
+            "--identifier",
+            "bot-model",
+            "--yes",
+        ),
+    ]
+
+
+def test_model_operation_detects_inference_embedding_and_unload():
+    inference = gateway._model_operation(
+        "/v1/chat/completions",
+        json.dumps({"model": "vision-model"}).encode(),
+    )
+    assert inference == {
+        "model": "vision-model",
+        "exclusive": False,
+        "unload": False,
+    }
+    embedding = gateway._model_operation(
+        "/v1/embeddings",
+        json.dumps({"model": "embedding-model"}).encode(),
+    )
+    assert embedding["model"] == "embedding-model"
+    assert embedding["unload"] is False
+    unload = gateway._model_operation(
+        "/api/v1/models/unload",
+        json.dumps({"instance_id": "vision-model"}).encode(),
+    )
+    assert unload == {
+        "model": "vision-model",
+        "exclusive": True,
+        "unload": True,
+    }
+
+
+def test_cold_model_request_serializes_followers_then_allows_warm_parallelism(tmp_path):
+    coordinator = gateway.Coordinator(
+        _config(tmp_path, max_concurrent_requests=2),
+        adapter=FakeAdapter(True),
+    )
+    first = coordinator.begin_model_request("vision-model")
+    assert first["leader"] is True
+
+    follower_ready = threading.Event()
+    follower_release = threading.Event()
+
+    def follower():
+        token = coordinator.begin_model_request("vision-model")
+        follower_ready.set()
+        follower_release.wait(timeout=2)
+        coordinator.end_model_request(token, success=True)
+
+    thread = threading.Thread(target=follower)
+    thread.start()
+    assert follower_ready.wait(timeout=0.05) is False
+    coordinator.end_model_request(first, success=True)
+    assert follower_ready.wait(timeout=1) is True
+    follower_release.set()
+    thread.join(timeout=2)
+    assert thread.is_alive() is False
+    assert coordinator.status()["warm_model"] == "vision-model"
+
+
 def test_config_rejects_cloud_or_unknown_provider(tmp_path):
     with pytest.raises(ValueError, match="DUOTONGFA_PROVIDER"):
         runtime.GatewayConfig.from_env(
@@ -189,9 +319,10 @@ def test_lm_studio_process_filter_does_not_count_gateway_or_proxy(monkeypatch):
         (103, "/home/tester/.lmstudio/.internal/utils/node worker.js"),
         (104, "/usr/bin/llmster --serve"),
         (105, "/bin/zsh -lc rg '/LM Studio.app/|/.lmstudio/.internal/'"),
+        (106, "/tmp/.lmstudio/extensions/backends/llama.cpp/llama-server --model x.gguf"),
     ]))
     found = runtime.lm_studio_processes(system="Darwin")
-    assert [item["pid"] for item in found] == [102, 103, 104]
+    assert [item["pid"] for item in found] == [102, 103, 104, 106]
 
 
 def test_lm_studio_stop_uses_server_stop_without_unload_wakeup(tmp_path, monkeypatch):
@@ -355,6 +486,38 @@ def test_watchdog_releases_stale_lock_without_starting_model(tmp_path, monkeypat
     assert coordinator.render_lock() is None
     assert coordinator.status()["metrics"]["watchdog_releases"] == 1
     assert adapter.starts == 0
+
+
+def test_promptless_render_releases_when_observed_queue_drains(tmp_path, monkeypatch):
+    adapter = FakeAdapter(True)
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+    prepared = coordinator.prepare_render({"job_id": "job-no-prompt"})
+    coordinator.commit_render({"token": prepared["token"], "prompt_id": ""})
+    busy = iter((True, False))
+    monkeypatch.setattr(coordinator, "_comfyui_queue_busy", lambda: next(busy))
+
+    coordinator.monitor_once()
+    assert coordinator.render_lock()["queue_seen"] is True
+    coordinator.monitor_once()
+    assert coordinator.render_lock() is None
+    assert coordinator.status()["events"][-1]["reason"] == "queue_drained"
+
+
+def test_promptless_render_without_queue_releases_after_grace(tmp_path, monkeypatch):
+    adapter = FakeAdapter(True)
+    coordinator = gateway.Coordinator(
+        _config(tmp_path, orphan_render_grace_seconds=15),
+        adapter=adapter,
+    )
+    prepared = coordinator.prepare_render({"job_id": "job-never-queued"})
+    coordinator.commit_render({"token": prepared["token"], "prompt_id": ""})
+    with coordinator._render_lock_guard:
+        coordinator._render_lock["updated_at"] -= 20
+    monkeypatch.setattr(coordinator, "_comfyui_queue_busy", lambda: False)
+
+    coordinator.monitor_once()
+    assert coordinator.render_lock() is None
+    assert coordinator.status()["events"][-1]["reason"] == "orphan_no_queue"
 
 
 def test_render_monitor_reasserts_shutdown_after_unexpected_wakeup(tmp_path, monkeypatch):
@@ -661,6 +824,7 @@ def test_forced_model_policy_is_forwarded_and_reported(tmp_path):
             assert json.loads(response.read()) == {"ok": True}
         assert received == [{"model": "pinned-model", "messages": []}]
         assert coordinator.status()["metrics"]["model_overrides"] == 1
+        assert coordinator.status()["warm_model"] == "pinned-model"
     finally:
         server.shutdown()
         server.server_close()

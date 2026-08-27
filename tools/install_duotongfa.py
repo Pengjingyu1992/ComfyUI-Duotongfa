@@ -70,7 +70,16 @@ def _service_environment(args) -> Dict[str, str]:
         "DUOTONGFA_UPSTREAM_URL": args.upstream,
         "DUOTONGFA_IDLE_SECONDS": str(args.idle_seconds),
         "DUOTONGFA_RESUME_POLICY": args.resume_policy,
+        "DUOTONGFA_ORPHAN_RENDER_GRACE_SECONDS": str(args.orphan_render_grace_seconds),
+        "DUOTONGFA_MAX_CONCURRENT_REQUESTS": str(args.max_concurrent_requests),
+        "DUOTONGFA_LM_STUDIO_CONTEXT_LENGTH": str(args.lm_studio_context_length),
+        "DUOTONGFA_LM_STUDIO_PARALLEL": str(args.lm_studio_parallel),
+        "DUOTONGFA_LM_STUDIO_MODEL_TTL_SECONDS": str(
+            args.lm_studio_model_ttl_seconds
+        ),
     }
+    if args.force_model:
+        values["DUOTONGFA_FORCE_MODEL"] = args.force_model
     if args.force_app_exit:
         values["DUOTONGFA_LM_STUDIO_FORCE_APP_EXIT"] = "1"
     if args.allow_external_stop:
@@ -204,6 +213,12 @@ def main(argv=None) -> int:
     parser.add_argument("--upstream", default="http://127.0.0.1:1235")
     parser.add_argument("--idle-seconds", type=float, default=300)
     parser.add_argument("--resume-policy", choices=("on-demand", "restore", "never"), default="on-demand")
+    parser.add_argument("--orphan-render-grace-seconds", type=float, default=60)
+    parser.add_argument("--max-concurrent-requests", type=int, default=0)
+    parser.add_argument("--lm-studio-context-length", type=int, default=0)
+    parser.add_argument("--lm-studio-parallel", type=int, default=0)
+    parser.add_argument("--lm-studio-model-ttl-seconds", type=int, default=0)
+    parser.add_argument("--force-model", default="")
     parser.add_argument("--force-app-exit", action="store_true")
     parser.add_argument("--allow-external-stop", action="store_true")
     parser.add_argument("--require-process-exit", action="store_true")

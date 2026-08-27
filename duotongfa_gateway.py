@@ -58,7 +58,14 @@ except ImportError:
 
 CONTROL_PATH = "/__duotongfa"
 MODEL_PATH_SUFFIXES = ("/models",)
-MODEL_SELECTION_PATH_SUFFIXES = ("/chat/completions", "/completions", "/responses")
+MODEL_SELECTION_PATH_SUFFIXES = (
+    "/chat/completions",
+    "/completions",
+    "/responses",
+    "/api/v1/chat",
+)
+MODEL_REQUEST_PATH_SUFFIXES = MODEL_SELECTION_PATH_SUFFIXES + ("/embeddings",)
+MODEL_UNLOAD_PATH_SUFFIXES = ("/api/v1/models/unload",)
 _EMPTY_MODELS_RESPONSE = b'{"object":"list","data":[]}'
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -141,6 +148,26 @@ def _force_request_model(
     payload["model"] = selected
     rewritten = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return rewritten, True, changed
+
+
+def _model_operation(path: str, body: Optional[bytes]) -> Dict[str, Any]:
+    """Identify model-bound requests for safe cold loads and model switches."""
+    clean = urlparse(str(path or "")).path.rstrip("/")
+    if not body:
+        return {"model": "", "exclusive": False, "unload": False}
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"model": "", "exclusive": False, "unload": False}
+    if not isinstance(payload, dict):
+        return {"model": "", "exclusive": False, "unload": False}
+    if any(clean.endswith(suffix) for suffix in MODEL_UNLOAD_PATH_SUFFIXES):
+        model = str(payload.get("instance_id") or payload.get("model") or "").strip()
+        return {"model": model, "exclusive": bool(model), "unload": bool(model)}
+    if any(clean.endswith(suffix) for suffix in MODEL_REQUEST_PATH_SUFFIXES):
+        model = str(payload.get("model") or "").strip()
+        return {"model": model, "exclusive": False, "unload": False}
+    return {"model": "", "exclusive": False, "unload": False}
 
 
 def _model_cache_key(path: str) -> str:
@@ -238,8 +265,19 @@ class Coordinator:
         self._events_guard = threading.Lock()
         self._state = "off"
         self._active_requests = 0
+        self._queued_requests = 0
         self._last_activity = time.monotonic()
         self._started_by_gateway = False
+        self._request_slots = (
+            threading.BoundedSemaphore(config.max_concurrent_requests)
+            if config.max_concurrent_requests > 0
+            else None
+        )
+        self._model_condition = threading.Condition(threading.RLock())
+        self._active_model: Optional[str] = None
+        self._model_active_requests = 0
+        self._model_warming = False
+        self._warm_model: Optional[str] = None
         self._render_lock: Optional[Dict[str, Any]] = None
         self._model_cache: Dict[str, Tuple[str, bytes]] = {}
         self._events: Deque[Dict[str, Any]] = collections.deque(maxlen=100)
@@ -253,6 +291,7 @@ class Coordinator:
             "unexpected_wakeups": 0,
             "model_overrides": 0,
             "forward_recoveries": 0,
+            "model_warmups": 0,
         }
         self._stop_event = threading.Event()
         self._load_state()
@@ -269,7 +308,13 @@ class Coordinator:
         with self._condition:
             state = self._state
             active = self._active_requests
+            queued = self._queued_requests
             owned = self._started_by_gateway
+        with self._model_condition:
+            active_model = self._active_model
+            model_active_requests = self._model_active_requests
+            warm_model = self._warm_model
+            model_warming = self._model_warming
         with self._render_lock_guard:
             render_lock = dict(self._render_lock) if self._render_lock else None
         return {
@@ -278,8 +323,13 @@ class Coordinator:
             "updated_at": time.time(),
             "gateway_state": state,
             "active_requests": active,
+            "queued_requests": queued,
             "started_by_gateway": owned,
             "render_lock": render_lock,
+            "active_model": active_model,
+            "model_active_requests": model_active_requests,
+            "warm_model": warm_model,
+            "model_warming": model_warming,
         }
 
     def _persist_state(self) -> None:
@@ -359,6 +409,12 @@ class Coordinator:
             return dict(self._render_lock) if self._render_lock else None
 
     def begin_request(self) -> None:
+        if self._request_slots is not None:
+            with self._condition:
+                self._queued_requests += 1
+            self._request_slots.acquire()
+            with self._condition:
+                self._queued_requests = max(0, self._queued_requests - 1)
         with self._condition:
             self._active_requests += 1
             self._last_activity = time.monotonic()
@@ -369,6 +425,85 @@ class Coordinator:
             self._active_requests = max(0, self._active_requests - 1)
             self._last_activity = time.monotonic()
             self._condition.notify_all()
+        if self._request_slots is not None:
+            self._request_slots.release()
+
+    def begin_model_request(
+        self,
+        model: str,
+        *,
+        exclusive: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Serialize cold loads/model switches while allowing warm-model traffic."""
+        model = str(model or "").strip()
+        if not model:
+            return None
+        with self._model_condition:
+            while True:
+                if exclusive:
+                    if self._model_active_requests == 0:
+                        self._active_model = model
+                        self._model_active_requests = 1
+                        return {"model": model, "leader": False, "exclusive": True}
+                elif self._active_model not in {None, model} or self._model_warming:
+                    pass
+                else:
+                    if self._active_model is None:
+                        self._active_model = model
+                    leader = self._warm_model != model
+                    if leader:
+                        self._model_warming = True
+                        with self._condition:
+                            self._metrics["model_warmups"] += 1
+                    self._model_active_requests += 1
+                    return {
+                        "model": model,
+                        "leader": leader,
+                        "exclusive": False,
+                    }
+                self._model_condition.wait(timeout=0.25)
+
+    def end_model_request(
+        self,
+        token: Optional[Dict[str, Any]],
+        *,
+        success: bool,
+    ) -> None:
+        if not token:
+            return
+        model = str(token.get("model") or "")
+        with self._model_condition:
+            if token.get("leader"):
+                if success:
+                    self._warm_model = model
+                self._model_warming = False
+            elif not success and self._warm_model == model:
+                self._warm_model = None
+            self._model_active_requests = max(0, self._model_active_requests - 1)
+            if self._model_active_requests == 0:
+                self._active_model = None
+            self._model_condition.notify_all()
+
+    def prepare_model(self, token: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not token or not token.get("leader"):
+            return {"ok": True, "prepared": False}
+        prepare = getattr(self.adapter, "prepare_model", None)
+        if not callable(prepare):
+            return {"ok": True, "prepared": False}
+        result = prepare(str(token.get("model") or ""))
+        self._record(
+            "model_profile_ready",
+            model=token.get("model"),
+            already_loaded=bool(result.get("already_loaded")),
+        )
+        return result
+
+    def mark_model_cold(self, model: str = "") -> None:
+        model = str(model or "").strip()
+        with self._model_condition:
+            if not model or self._warm_model == model:
+                self._warm_model = None
+            self._model_condition.notify_all()
 
     def mark_blocked(self) -> None:
         with self._condition:
@@ -402,6 +537,7 @@ class Coordinator:
             self._condition.notify_all()
         try:
             result = self.adapter.start()
+            self.mark_model_cold()
             with self._condition:
                 self._state = "on"
                 self._started_by_gateway = bool(result.get("started"))
@@ -452,6 +588,7 @@ class Coordinator:
             self._record("backend_stopped", reason=reason)
             return {"ok": True, "stop": stopped, "release": released}
         finally:
+            self.mark_model_cold()
             with self._condition:
                 self._state = "off"
                 self._started_by_gateway = False
@@ -677,6 +814,13 @@ class Coordinator:
         # release the lock now instead of waiting for the watchdog.
         return True
 
+    def _comfyui_queue_busy(self) -> Optional[bool]:
+        """Return whether ComfyUI has queued work, or None when unreachable."""
+        queue = _json_url(f"{self.config.comfyui_url}/queue")
+        if queue is None:
+            return None
+        return any(queue.get(key) for key in ("queue_running", "queue_pending"))
+
     def monitor_once(self) -> None:
         lock = self.render_lock()
         if lock:
@@ -697,12 +841,43 @@ class Coordinator:
                             job_id=lock.get("job_id"),
                             error=stopped,
                         )
-            terminal = self._prompt_terminal(str(lock.get("prompt_id") or ""))
+            prompt_id = str(lock.get("prompt_id") or "")
+            terminal = self._prompt_terminal(prompt_id)
             age = time.time() - float(lock.get("updated_at") or lock.get("created_at") or 0)
-            if terminal is True or age >= self.config.render_watchdog_seconds:
+            release_reason = ""
+            if terminal is True:
+                release_reason = "prompt_terminal"
+            elif not prompt_id:
+                queue_busy = self._comfyui_queue_busy()
+                if queue_busy is True:
+                    changed = False
+                    with self._render_lock_guard:
+                        current = self._render_lock
+                        if (
+                            current
+                            and current.get("token") == lock.get("token")
+                            and not current.get("queue_seen")
+                        ):
+                            current["queue_seen"] = True
+                            current["queue_seen_at"] = time.time()
+                            changed = True
+                    if changed:
+                        self._record(
+                            "render_queue_detected",
+                            job_id=lock.get("job_id"),
+                        )
+                        self._persist_state()
+                elif queue_busy is False:
+                    if lock.get("queue_seen"):
+                        release_reason = "queue_drained"
+                    elif age >= self.config.orphan_render_grace_seconds:
+                        release_reason = "orphan_no_queue"
+            if not release_reason and age >= self.config.render_watchdog_seconds:
+                release_reason = "timeout"
+            if release_reason:
                 self.release_render(
-                    {"token": lock.get("token"), "reason": "prompt_terminal" if terminal else "timeout"},
-                    watchdog=True,
+                    {"token": lock.get("token"), "reason": release_reason},
+                    watchdog=(release_reason == "timeout"),
                 )
             return
         with self._condition:
@@ -874,9 +1049,18 @@ class Handler(BaseHTTPRequestHandler):
         if model_changed:
             self.coordinator.mark_model_override()
 
+        operation = _model_operation(self.path, request_body)
+        model_token: Optional[Dict[str, Any]] = None
+        request_ok = False
+        unload_ok = False
         self.coordinator.begin_request()
         try:
             self.coordinator.ensure_on()
+            model_token = self.coordinator.begin_model_request(
+                str(operation.get("model") or ""),
+                exclusive=bool(operation.get("exclusive")),
+            )
+            self.coordinator.prepare_model(model_token)
             url = _upstream_request_url(
                 self.coordinator.config.upstream_url, self.path,
             )
@@ -926,10 +1110,13 @@ class Handler(BaseHTTPRequestHandler):
                 }, status=502)
                 return
 
+            response_status = int(response.status)
+            request_ok = response_status < 500
+            unload_ok = bool(operation.get("unload")) and 200 <= response_status < 300
             content_type = response.headers.get("Content-Type", "application/json")
             streaming = "text/event-stream" in content_type.lower()
             model_discovery = method == "GET" and _model_path(self.path)
-            self.send_response(int(response.status))
+            self.send_response(response_status)
             self.send_header("Content-Type", content_type)
             if model_discovery:
                 self.send_header("X-Duotongfa-State", "READY")
@@ -952,7 +1139,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
 
-            response_status = int(response.status)
             payload = response.read()
             if connection is not None:
                 connection.close()
@@ -967,6 +1153,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"error": {"message": str(exc)}}, status=503)
         finally:
+            self.coordinator.end_model_request(model_token, success=request_ok)
+            if unload_ok:
+                self.coordinator.mark_model_cold(str(operation.get("model") or ""))
             self.coordinator.end_request()
 
     def do_GET(self) -> None:

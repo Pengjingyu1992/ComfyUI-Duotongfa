@@ -8,6 +8,17 @@ cd ComfyUI-Duotongfa
 python tools/install_duotongfa.py install --start
 ```
 
+`0.2.4` 可以在安装用户服务时持久化模型与并发配置，例如：
+
+```bash
+python tools/install_duotongfa.py install --start \
+  --max-concurrent-requests 2 \
+  --lm-studio-context-length 32768 \
+  --lm-studio-parallel 2 \
+  --lm-studio-model-ttl-seconds 360 \
+  --force-model bot-model
+```
+
 仓库可以放在任意目录，也可以放进 `ComfyUI/custom_nodes`。它是伴随服务，故意不注册画布节点。安装器会把两个无第三方依赖的运行文件复制到稳定的当前用户目录，再创建 macOS LaunchAgent、Linux systemd 用户服务或 Windows 当前用户启动脚本。
 
 LM Studio 低内存机器的完整接管示例：
