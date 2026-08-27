@@ -58,6 +58,8 @@ except ImportError:
 
 CONTROL_PATH = "/__duotongfa"
 MODEL_PATH_SUFFIXES = ("/models",)
+MODEL_SELECTION_PATH_SUFFIXES = ("/chat/completions", "/completions", "/responses")
+_EMPTY_MODELS_RESPONSE = b'{"object":"list","data":[]}'
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -105,6 +107,53 @@ def _is_loopback(host: str) -> bool:
 def _model_path(path: str) -> bool:
     clean = urlparse(str(path or "")).path.rstrip("/")
     return any(clean.endswith(suffix) for suffix in MODEL_PATH_SUFFIXES)
+
+
+def _model_selection_path(path: str) -> bool:
+    clean = urlparse(str(path or "")).path.rstrip("/")
+    return any(clean.endswith(suffix) for suffix in MODEL_SELECTION_PATH_SUFFIXES)
+
+
+def _force_request_model(
+    method: str,
+    path: str,
+    body: Optional[bytes],
+    forced_model: str,
+) -> Tuple[Optional[bytes], bool, bool]:
+    """Apply the optional local model policy to generation requests only.
+
+    Embedding requests deliberately keep their own model selection.  The
+    policy is configuration-driven so a deployment can pin today's known
+    model without making the gateway itself model-specific.
+    """
+    selected = str(forced_model or "").strip()
+    if method != "POST" or not selected or not _model_selection_path(path):
+        return body, False, False
+    if not body:
+        raise ValueError("forced model policy requires a JSON request body")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("forced model policy requires a valid JSON request body") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("forced model policy requires a JSON object request body")
+    changed = payload.get("model") != selected
+    payload["model"] = selected
+    rewritten = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return rewritten, True, changed
+
+
+def _model_cache_key(path: str) -> str:
+    """Normalize the two supported OpenAI model-discovery paths.
+
+    Clients may be configured with either a gateway root or a ``/v1`` base.
+    Both paths describe the same upstream model list, so keeping separate
+    cache entries would turn a valid cold-cache hit into an unnecessary miss.
+    """
+    clean = urlparse(str(path or "")).path.rstrip("/")
+    if clean in {"/models", "/v1/models"}:
+        return "/models"
+    return clean
 
 
 def _upstream_request_url(upstream: str, request_path: str) -> str:
@@ -202,6 +251,8 @@ class Coordinator:
             "blocked_requests": 0,
             "watchdog_releases": 0,
             "unexpected_wakeups": 0,
+            "model_overrides": 0,
+            "forward_recoveries": 0,
         }
         self._stop_event = threading.Event()
         self._load_state()
@@ -287,18 +338,18 @@ class Coordinator:
             except Exception:
                 continue
             if body:
-                self._model_cache[str(path)] = (
+                self._model_cache[_model_cache_key(str(path))] = (
                     str(item.get("content_type") or "application/json"),
                     body,
                 )
 
     def cached_model_response(self, path: str) -> Optional[Tuple[str, bytes]]:
-        clean = urlparse(path).path
+        clean = _model_cache_key(path)
         with self._cache_guard:
             return self._model_cache.get(clean)
 
     def cache_model_response(self, path: str, content_type: str, body: bytes) -> None:
-        clean = urlparse(path).path
+        clean = _model_cache_key(path)
         with self._cache_guard:
             self._model_cache[clean] = (content_type, body)
         self._persist_cache()
@@ -322,6 +373,20 @@ class Coordinator:
     def mark_blocked(self) -> None:
         with self._condition:
             self._metrics["blocked_requests"] += 1
+
+    def mark_model_override(self) -> None:
+        with self._condition:
+            self._metrics["model_overrides"] += 1
+
+    def recover_backend_for_retry(self) -> bool:
+        """Restart a backend that vanished after the initial readiness check."""
+        if self.adapter.healthy():
+            return False
+        self.ensure_on()
+        with self._condition:
+            self._metrics["forward_recoveries"] += 1
+        self._record("backend_recovered", reason="forward_retry")
+        return True
 
     def ensure_on(self) -> Dict[str, Any]:
         if self.render_lock():
@@ -587,7 +652,10 @@ class Coordinator:
         if not prompt_id:
             return None
         history = _json_url(f"{self.config.comfyui_url}/history/{prompt_id}")
-        if history and prompt_id in history:
+        if history is None:
+            # ComfyUI did not answer; keep the lock conservative.
+            return None
+        if prompt_id in history:
             entry = history.get(prompt_id) or {}
             status = entry.get("status") or {}
             if status.get("completed") is True:
@@ -597,12 +665,17 @@ class Coordinator:
                 return True
             return False
         queue = _json_url(f"{self.config.comfyui_url}/queue")
-        if queue:
-            for key in ("queue_running", "queue_pending"):
-                for item in queue.get(key) or []:
-                    if isinstance(item, (list, tuple)) and prompt_id in item:
-                        return False
-        return None
+        if queue is None:
+            # ComfyUI did not answer; keep the lock conservative.
+            return None
+        for key in ("queue_running", "queue_pending"):
+            for item in queue.get(key) or []:
+                if isinstance(item, (list, tuple)) and prompt_id in item:
+                    return False
+        # ComfyUI answered both queries and tracks the prompt in neither
+        # history nor the queue: the render can no longer be observed, so
+        # release the lock now instead of waiting for the watchdog.
+        return True
 
     def monitor_once(self) -> None:
         lock = self.render_lock()
@@ -740,24 +813,66 @@ class Handler(BaseHTTPRequestHandler):
             }
         }, status=423)
 
+    def _send_model_discovery(
+        self,
+        *,
+        state: str,
+        cached: Optional[Tuple[str, bytes]],
+    ) -> None:
+        """Serve model discovery without ever waking a cold backend."""
+        if cached:
+            content_type, payload = cached
+            cache_state = "HIT"
+        else:
+            content_type = "application/json; charset=utf-8"
+            payload = _EMPTY_MODELS_RESPONSE
+            cache_state = "MISS"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("X-Duotongfa-State", state)
+        self.send_header("X-Duotongfa-Cache", cache_state)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(payload)
+        self.close_connection = True
+
     def _forward(self, method: str, body: Optional[bytes]) -> None:
         lock = self.coordinator.render_lock()
         if lock:
             if method == "GET" and _model_path(self.path):
-                cached = self.coordinator.cached_model_response(self.path)
-                if cached:
-                    content_type, payload = cached
-                    self.send_response(200)
-                    self.send_header("Content-Type", content_type)
-                    self.send_header("X-Duotongfa-State", "RENDERING")
-                    self.send_header("Content-Length", str(len(payload)))
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    self.wfile.write(payload)
-                    self.close_connection = True
-                    return
+                self._send_model_discovery(
+                    state="RENDERING",
+                    cached=self.coordinator.cached_model_response(self.path),
+                )
+                return
             self._send_render_busy(lock)
             return
+
+        # Model discovery is a UI/readiness concern, not inference.  A cold
+        # gateway must answer from its persisted cache (or an explicit empty
+        # OpenAI-compatible list) instead of starting LM Studio for a poll.
+        if method == "GET" and _model_path(self.path) \
+                and not self.coordinator.adapter.healthy():
+            self._send_model_discovery(
+                state="COLD",
+                cached=self.coordinator.cached_model_response(self.path),
+            )
+            return
+
+        request_body = body if method in {"POST", "PUT", "PATCH"} else None
+        try:
+            request_body, model_policy_applied, model_changed = _force_request_model(
+                method,
+                self.path,
+                request_body,
+                self.coordinator.config.forced_model,
+            )
+        except ValueError as exc:
+            self._send_json({"error": {"message": str(exc)}}, status=400)
+            return
+        if model_changed:
+            self.coordinator.mark_model_override()
 
         self.coordinator.begin_request()
         try:
@@ -771,7 +886,6 @@ class Handler(BaseHTTPRequestHandler):
                 if name.lower() not in HOP_BY_HOP_HEADERS
                 and name.lower() not in {"host", "content-length"}
             }
-            request_body = body if method in {"POST", "PUT", "PATCH"} else None
             response = None
             connection = None
             last_error: Optional[Exception] = None
@@ -788,6 +902,7 @@ class Handler(BaseHTTPRequestHandler):
                         connection.close()
                         response = None
                         connection = None
+                        self.coordinator.recover_backend_for_retry()
                         time.sleep(0.5)
                         continue
                     break
@@ -799,6 +914,11 @@ class Handler(BaseHTTPRequestHandler):
                     connection = None
                     if attempt:
                         break
+                    try:
+                        self.coordinator.recover_backend_for_retry()
+                    except Exception as recovery_exc:
+                        last_error = recovery_exc
+                        break
                     time.sleep(0.5)
             if response is None:
                 self._send_json({
@@ -808,8 +928,14 @@ class Handler(BaseHTTPRequestHandler):
 
             content_type = response.headers.get("Content-Type", "application/json")
             streaming = "text/event-stream" in content_type.lower()
+            model_discovery = method == "GET" and _model_path(self.path)
             self.send_response(int(response.status))
             self.send_header("Content-Type", content_type)
+            if model_discovery:
+                self.send_header("X-Duotongfa-State", "READY")
+                self.send_header("X-Duotongfa-Cache", "REFRESHED")
+            if model_policy_applied:
+                self.send_header("X-Duotongfa-Model-Policy", "FORCED")
             self.send_header("Connection", "close")
             if streaming:
                 self.end_headers()
@@ -830,7 +956,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = response.read()
             if connection is not None:
                 connection.close()
-            if method == "GET" and _model_path(self.path) and response_status == 200:
+            if model_discovery and response_status == 200:
                 self.coordinator.cache_model_response(self.path, content_type, payload)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()

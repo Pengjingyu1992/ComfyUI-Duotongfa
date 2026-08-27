@@ -10,6 +10,12 @@ Duotongfa is a local resource handoff gateway for machines where ComfyUI and a l
 
 On memory-constrained workstations, “stop the LLM” is often only an intention: a GUI, model refresh, health check, or worker process can keep the model resident or wake it again. The result is slow rendering, swapping, 503 errors, and workflows that stall at low progress. Duotongfa turns that informal handoff into a verifiable state machine.
 
+## Why unloading the model during rendering can be faster
+
+An LLM and an image-generation stack can compete for the same GPU or unified memory. Unloading the LLM before rendering can reduce memory pressure and swapping. The benefit depends on the models, runtime, and hardware.
+
+The handoff drains LLM requests, unloads and verifies the model resources, lets ComfyUI render, and releases the lock. With the on-demand policy, the next LLM request restarts the backend when needed.
+
 The name and control idea were inspired by multi-way thermal valves and Tesla's octovalve: several consumers share a limited resource pool, while one coordinator selects a safe route for the current workload. This is an engineering analogy only; the project is not affiliated with Tesla.
 
 ## What it does

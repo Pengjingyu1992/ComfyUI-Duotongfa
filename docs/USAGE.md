@@ -24,3 +24,16 @@ Resume policies:
 - `never`: never restart automatically.
 
 During rendering, `/v1/models` can return cached discovery data. Chat and embedding requests receive HTTP 423 and are never forwarded to the LLM backend.
+
+## Force a deployment model
+
+To pin generation requests to a known local model, configure the model ID before starting the gateway:
+
+```bash
+export DUOTONGFA_FORCE_MODEL="your-model-id"
+python duotongfa_gateway.py serve
+```
+
+The gateway overrides `model` for `/chat/completions`, `/completions`, and `/responses`, and returns `X-Duotongfa-Model-Policy: FORCED`. Embedding requests keep their own model. Leave the setting empty to restore general client-selected routing. Use the actual model ID returned by LM Studio `/models`; a download or display name may differ.
+
+Do not use `lms ps`, `lms ls`, or `lms server status` as passive cold-state probes because some LM Studio releases wake their background service when those commands run. Use `python duotongfa_gateway.py status`, gateway state, port checks, or process checks instead. The cold model cache refreshes only after a successful `/models` request while the backend is READY, so a newly downloaded model appears after the next online refresh.

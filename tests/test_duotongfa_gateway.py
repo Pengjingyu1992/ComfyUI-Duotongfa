@@ -395,6 +395,66 @@ def _start_server(server):
     return thread
 
 
+def test_prompt_terminal_releases_lock_when_prompt_vanished(tmp_path, monkeypatch):
+    adapter = FakeAdapter(True)
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+    prepared = coordinator.prepare_render({"job_id": "job-vanished"})
+    coordinator.commit_render({"token": prepared["token"], "prompt_id": "gone-prompt"})
+
+    def empty_everywhere(url, timeout=2.0):
+        if "/history/" in url:
+            return {}
+        return {"queue_running": [], "queue_pending": []}
+
+    monkeypatch.setattr(gateway, "_json_url", empty_everywhere)
+    coordinator.monitor_once()
+    assert coordinator.render_lock() is None
+
+
+def test_prompt_terminal_holds_lock_when_comfyui_unreachable(tmp_path, monkeypatch):
+    adapter = FakeAdapter(True)
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+    prepared = coordinator.prepare_render({"job_id": "job-unreachable"})
+    coordinator.commit_render({"token": prepared["token"], "prompt_id": "p"})
+    monkeypatch.setattr(gateway, "_json_url", lambda url, timeout=2.0: None)
+    coordinator.monitor_once()
+    assert coordinator.render_lock() is not None
+
+
+def test_prompt_terminal_distinguishes_absent_from_unknown(tmp_path, monkeypatch):
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=FakeAdapter(True))
+    responses: dict = {}
+
+    def fake_json(url, timeout=2.0):
+        return responses.get(url)
+
+    monkeypatch.setattr(gateway, "_json_url", fake_json)
+    base = coordinator.config.comfyui_url
+    history_url = f"{base}/history/p"
+    queue_url = f"{base}/queue"
+
+    responses = {
+        history_url: {},
+        queue_url: {"queue_running": [["1", "p"]], "queue_pending": []},
+    }
+    assert coordinator._prompt_terminal("p") is False
+
+    responses = {
+        history_url: {},
+        queue_url: {"queue_running": [], "queue_pending": []},
+    }
+    assert coordinator._prompt_terminal("p") is True
+
+    responses = {history_url: None}
+    assert coordinator._prompt_terminal("p") is None
+
+    responses = {history_url: {}, queue_url: None}
+    assert coordinator._prompt_terminal("p") is None
+
+    responses = {history_url: {"p": {"status": {"completed": True}}}}
+    assert coordinator._prompt_terminal("p") is True
+
+
 def test_gateway_has_one_control_path_and_serves_cached_models_during_render(tmp_path):
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), _UpstreamHandler)
     _start_server(upstream)
@@ -410,6 +470,8 @@ def test_gateway_has_one_control_path_and_serves_cached_models_during_render(tmp
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         with urllib.request.urlopen(f"{base}/v1/models", timeout=3) as response:
+            assert response.headers["X-Duotongfa-State"] == "READY"
+            assert response.headers["X-Duotongfa-Cache"] == "REFRESHED"
             assert json.loads(response.read())["data"][0]["id"] == "local-model"
         with urllib.request.urlopen(f"{base}{gateway.CONTROL_PATH}", timeout=3) as response:
             status = json.loads(response.read())
@@ -424,6 +486,7 @@ def test_gateway_has_one_control_path_and_serves_cached_models_during_render(tmp
             prepared = json.loads(response.read())
         with urllib.request.urlopen(f"{base}/v1/models", timeout=3) as response:
             assert response.headers["X-Duotongfa-State"] == "RENDERING"
+            assert response.headers["X-Duotongfa-Cache"] == "HIT"
             assert json.loads(response.read())["data"][0]["id"] == "local-model"
 
         blocked = urllib.request.Request(
@@ -450,3 +513,167 @@ def test_gateway_has_one_control_path_and_serves_cached_models_during_render(tmp
         server.server_close()
         upstream.shutdown()
         upstream.server_close()
+
+
+def test_cold_model_discovery_uses_cache_without_waking_and_normalizes_v1(tmp_path):
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _UpstreamHandler)
+    _start_server(upstream)
+    config = _config(tmp_path, upstream_url=f"http://127.0.0.1:{upstream.server_address[1]}")
+    adapter = FakeAdapter(True)
+    coordinator = gateway.Coordinator(config, adapter=adapter)
+    server = gateway.GatewayServer(("127.0.0.1", 0), gateway.Handler, coordinator)
+    _start_server(server)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(f"{base}/v1/models", timeout=3) as response:
+            assert json.loads(response.read())["data"][0]["id"] == "local-model"
+        starts_before_cold_read = adapter.starts
+        adapter.healthy_value = False
+
+        with urllib.request.urlopen(f"{base}/models", timeout=3) as response:
+            assert response.headers["X-Duotongfa-State"] == "COLD"
+            assert response.headers["X-Duotongfa-Cache"] == "HIT"
+            assert json.loads(response.read())["data"][0]["id"] == "local-model"
+        assert adapter.starts == starts_before_cold_read
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_cold_model_discovery_returns_empty_openai_list_without_waking(tmp_path):
+    adapter = FakeAdapter(False)
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+    server = gateway.GatewayServer(("127.0.0.1", 0), gateway.Handler, coordinator)
+    _start_server(server)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(f"{base}/v1/models", timeout=3) as response:
+            assert response.headers["X-Duotongfa-State"] == "COLD"
+            assert response.headers["X-Duotongfa-Cache"] == "MISS"
+            assert json.loads(response.read()) == {"object": "list", "data": []}
+        assert adapter.starts == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_cold_model_cache_survives_a_gateway_restart(tmp_path):
+    cached = b'{"object":"list","data":[{"id":"gemma"}]}'
+    first = gateway.Coordinator(_config(tmp_path), adapter=FakeAdapter(True))
+    first.cache_model_response("/v1/models", "application/json", cached)
+
+    adapter = FakeAdapter(False)
+    restarted = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+    server = gateway.GatewayServer(
+        ("127.0.0.1", 0), gateway.Handler, restarted)
+    _start_server(server)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with urllib.request.urlopen(f"{base}/models", timeout=3) as response:
+            assert response.headers["X-Duotongfa-State"] == "COLD"
+            assert response.headers["X-Duotongfa-Cache"] == "HIT"
+            assert response.read() == cached
+        assert adapter.starts == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_inference_request_still_wakes_a_cold_backend(tmp_path):
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _UpstreamHandler)
+    _start_server(upstream)
+    config = _config(tmp_path, upstream_url=f"http://127.0.0.1:{upstream.server_address[1]}")
+    adapter = FakeAdapter(False)
+    coordinator = gateway.Coordinator(config, adapter=adapter)
+    server = gateway.GatewayServer(("127.0.0.1", 0), gateway.Handler, coordinator)
+    _start_server(server)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    request = urllib.request.Request(
+        f"{base}/v1/embeddings", data=b"{}", headers={"Content-Type": "application/json"},
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request, timeout=3)
+        assert raised.value.code == 501
+        assert adapter.starts == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_forced_model_rewrites_generation_but_preserves_embeddings():
+    original = json.dumps({"model": "client-choice", "input": "hello"}).encode()
+    rewritten, applied, changed = gateway._force_request_model(
+        "POST", "/v1/chat/completions", original, "pinned-model"
+    )
+    assert applied is True
+    assert changed is True
+    assert json.loads(rewritten) == {"model": "pinned-model", "input": "hello"}
+
+    embedding_body, embedding_applied, embedding_changed = gateway._force_request_model(
+        "POST", "/v1/embeddings", original, "pinned-model"
+    )
+    assert embedding_body == original
+    assert embedding_applied is False
+    assert embedding_changed is False
+
+
+def test_forced_model_policy_is_forwarded_and_reported(tmp_path):
+    received = []
+
+    class CaptureHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            received.append(json.loads(self.rfile.read(length)))
+            body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    _start_server(upstream)
+    config = _config(
+        tmp_path,
+        upstream_url=f"http://127.0.0.1:{upstream.server_address[1]}",
+        forced_model="pinned-model",
+    )
+    coordinator = gateway.Coordinator(config, adapter=FakeAdapter(True))
+    server = gateway.GatewayServer(("127.0.0.1", 0), gateway.Handler, coordinator)
+    _start_server(server)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    request = urllib.request.Request(
+        f"{base}/v1/chat/completions",
+        data=json.dumps({"model": "client-choice", "messages": []}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            assert response.headers["X-Duotongfa-Model-Policy"] == "FORCED"
+            assert json.loads(response.read()) == {"ok": True}
+        assert received == [{"model": "pinned-model", "messages": []}]
+        assert coordinator.status()["metrics"]["model_overrides"] == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_forward_recovery_restarts_a_backend_that_disappeared(tmp_path):
+    adapter = FakeAdapter(True)
+    coordinator = gateway.Coordinator(_config(tmp_path), adapter=adapter)
+    adapter.healthy_value = False
+
+    assert coordinator.recover_backend_for_retry() is True
+    assert adapter.starts == 1
+    assert coordinator.status()["metrics"]["forward_recoveries"] == 1
+    assert coordinator.recover_backend_for_retry() is False

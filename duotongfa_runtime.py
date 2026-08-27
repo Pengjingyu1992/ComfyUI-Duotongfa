@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 
 PROJECT_ID = "duotongfa"
 PROJECT_NAME = "多通阀"
-RUNTIME_VERSION = "0.2.0"
+RUNTIME_VERSION = "0.2.1"
 SUPPORTED_PROVIDERS = (
     "lm-studio",
     "ollama",
@@ -473,6 +473,7 @@ class GatewayConfig:
     comfyui_url: str
     start_command: Tuple[str, ...]
     stop_command: Tuple[str, ...]
+    forced_model: str = ""
 
     @classmethod
     def from_env(
@@ -521,6 +522,7 @@ class GatewayConfig:
             comfyui_url=str(values.get("DUOTONGFA_COMFYUI_URL", "http://127.0.0.1:8188")).strip().rstrip("/"),
             start_command=tuple(start),
             stop_command=tuple(stop),
+            forced_model=str(values.get("DUOTONGFA_FORCE_MODEL", "")).strip(),
         )
 
     def public_dict(self) -> Dict[str, Any]:
