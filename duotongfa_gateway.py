@@ -39,7 +39,9 @@ try:
         BackendAdapter,
         GatewayConfig,
         build_adapter,
+        endpoint_host_port,
         memory_snapshot,
+        port_is_open,
         release_ready,
         wait_for_release,
     )
@@ -50,7 +52,9 @@ except ImportError:
         BackendAdapter,
         GatewayConfig,
         build_adapter,
+        endpoint_host_port,
         memory_snapshot,
+        port_is_open,
         release_ready,
         wait_for_release,
     )
@@ -821,6 +825,14 @@ class Coordinator:
             return None
         return any(queue.get(key) for key in ("queue_running", "queue_pending"))
 
+    def _comfyui_port_open(self) -> bool:
+        """Distinguish a stopped ComfyUI from a busy but live HTTP server."""
+        try:
+            host, port = endpoint_host_port(self.config.comfyui_url)
+        except ValueError:
+            return False
+        return port_is_open(host, port, timeout=0.25)
+
     def monitor_once(self) -> None:
         lock = self.render_lock()
         if lock:
@@ -845,10 +857,44 @@ class Coordinator:
             terminal = self._prompt_terminal(prompt_id)
             age = time.time() - float(lock.get("updated_at") or lock.get("created_at") or 0)
             release_reason = ""
+            queue_busy: Optional[bool] = None
+            if terminal is None:
+                queue_busy = self._comfyui_queue_busy()
+                changed = False
+                unreachable_since: Optional[float] = None
+                with self._render_lock_guard:
+                    current = self._render_lock
+                    if current and current.get("token") == lock.get("token"):
+                        if queue_busy is None and not self._comfyui_port_open():
+                            unreachable_since = float(
+                                current.get("comfyui_unreachable_since")
+                                or time.time())
+                            if not current.get("comfyui_unreachable_since"):
+                                current["comfyui_unreachable_since"] = unreachable_since
+                                changed = True
+                        elif current.pop("comfyui_unreachable_since", None) is not None:
+                            changed = True
+                if changed:
+                    self._persist_state()
+                if (unreachable_since is not None
+                        and time.time() - unreachable_since
+                        >= self.config.orphan_render_grace_seconds):
+                    release_reason = "comfyui_unreachable"
+            else:
+                changed = False
+                with self._render_lock_guard:
+                    current = self._render_lock
+                    if (current and current.get("token") == lock.get("token")
+                            and current.pop(
+                                "comfyui_unreachable_since", None) is not None):
+                        changed = True
+                if changed:
+                    self._persist_state()
             if terminal is True:
                 release_reason = "prompt_terminal"
             elif not prompt_id:
-                queue_busy = self._comfyui_queue_busy()
+                if queue_busy is None and not release_reason:
+                    queue_busy = self._comfyui_queue_busy()
                 if queue_busy is True:
                     changed = False
                     with self._render_lock_guard:

@@ -24,4 +24,4 @@ jobs:
       - name: Reject common secrets and private paths
         shell: bash
         run: |
-          ! grep -RInE --exclude-dir=.git --exclude='ci.yml' '(sk-[A-Za-z0-9_-]{16,}|BEGIN [A-Z ]*PRIVATE KEY|/Users/[^/]+/|[A-Za-z]:\\Users\\[^\\]+\\)' .
+          ! grep -RInE --exclude-dir=.git --exclude='ci.yml' '(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{25,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|/Users/[^/]+/|[A-Za-z]:\\Users\\[^\\]+\\|[A-Za-z0-9_.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})' .

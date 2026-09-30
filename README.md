@@ -4,7 +4,7 @@
 
 Duotongfa is a local resource handoff gateway for machines where ComfyUI and a local LLM share GPU memory or unified memory. It gives the LLM runtime and the image renderer one lifecycle coordinator, so a render starts only after the LLM has actually released resources.
 
-Current release: **0.2.4**.
+Current release: **0.2.5**.
 
 ![Duotongfa architecture](docs/images/architecture.svg)
 

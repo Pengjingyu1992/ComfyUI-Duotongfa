@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -307,7 +308,14 @@ def test_lm_studio_stop_treats_closed_backend_as_off_without_claiming_gui(tmp_pa
     )
     adapter = runtime.LMStudioAdapter(config, env={})
     monkeypatch.setattr(adapter, "healthy", lambda: False)
-    monkeypatch.setattr(adapter, "processes", lambda: [{"name": "LM Studio"}])
+    monkeypatch.setattr(
+        adapter,
+        "processes",
+        lambda: [{
+            "pid": 101,
+            "command": "/Applications/LM Studio.app/Contents/MacOS/LM Studio",
+        }],
+    )
     assert adapter.stop(owned=False) == {"ok": True, "already_off": True}
 
 
@@ -319,10 +327,76 @@ def test_lm_studio_process_filter_does_not_count_gateway_or_proxy(monkeypatch):
         (103, "/home/tester/.lmstudio/.internal/utils/node worker.js"),
         (104, "/usr/bin/llmster --serve"),
         (105, "/bin/zsh -lc rg '/LM Studio.app/|/.lmstudio/.internal/'"),
-        (106, "/tmp/.lmstudio/extensions/backends/llama.cpp/llama-server --model x.gguf"),
+        (
+            106,
+            "/tmp/.lmstudio/extensions/backends/llama.cpp/llama-server "
+            "--model x.gguf --api-key local-secret-value",
+        ),
     ]))
     found = runtime.lm_studio_processes(system="Darwin")
     assert [item["pid"] for item in found] == [102, 103, 104, 106]
+    assert found[-1]["command"].endswith("--api-key [REDACTED]")
+    assert "local-secret-value" not in found[-1]["command"]
+
+
+def test_process_command_redacts_equals_and_space_separated_secrets():
+    command = "server --api-key=alpha --token beta --password gamma --port 1235"
+    redacted = runtime.redact_process_command(command)
+    assert redacted == (
+        "server --api-key=[REDACTED] --token [REDACTED] "
+        "--password [REDACTED] --port 1235"
+    )
+
+
+def test_lm_studio_model_process_filter_keeps_service_but_finds_workers():
+    processes = [
+        {
+            "pid": 101,
+            "command": "/Applications/LM Studio.app/Contents/MacOS/LM Studio --run-as-service",
+        },
+        {
+            "pid": 102,
+            "command": "/tmp/.lmstudio/.internal/utils/node worker.js",
+        },
+        {
+            "pid": 103,
+            "command": "/tmp/.lmstudio/extensions/backends/llama.cpp/llama-server --model x.gguf",
+        },
+        {"pid": 104, "command": "C:\\LM Studio\\llmster.exe --serve"},
+        {
+            "pid": 105,
+            "command": "/tmp/.lmstudio/extensions/backends/vendor/_amphibian/app-mlx/bin/python model_server.py",
+        },
+    ]
+    found = runtime.lm_studio_model_processes(processes, system="Darwin")
+    assert [item["pid"] for item in found] == [103, 104, 105]
+
+
+def test_release_gate_rejects_lingering_model_worker_without_strict_app_exit(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path, provider="lm-studio", require_process_exit=False)
+    worker_command = (
+        "llama-server.exe" if runtime.platform_id() == "windows" else
+        "/tmp/.lmstudio/extensions/backends/llama.cpp/llama-server --model x.gguf"
+    )
+
+    class LingeringWorker:
+        def status(self):
+            return {
+                "provider": "lm-studio",
+                "healthy": False,
+                "port_open": False,
+                "processes": [{
+                    "pid": 103,
+                    "command": worker_command,
+                }],
+            }
+
+    monkeypatch.setattr(runtime, "memory_snapshot", lambda: {"available_bytes": 10**9})
+    ready, detail = runtime.release_ready(LingeringWorker(), config)
+    assert ready is False
+    assert [item["pid"] for item in detail["model_processes"]] == [103]
 
 
 def test_lm_studio_stop_uses_server_stop_without_unload_wakeup(tmp_path, monkeypatch):
@@ -335,19 +409,82 @@ def test_lm_studio_stop_uses_server_stop_without_unload_wakeup(tmp_path, monkeyp
     )
     adapter = runtime.LMStudioAdapter(config, env={})
     calls = []
+    port_open = {"value": True}
 
     def fake_lms(*args, timeout=60):
         calls.append(args)
+        if args == ("server", "stop"):
+            port_open["value"] = False
         return runtime.subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(adapter, "_lms", fake_lms)
     monkeypatch.setattr(adapter, "healthy", lambda: False)
-    monkeypatch.setattr(runtime, "port_is_open", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        runtime, "port_is_open", lambda *_args, **_kwargs: port_open["value"]
+    )
     monkeypatch.setattr(adapter, "_quit_app", lambda: {"attempted": True})
     monkeypatch.setattr(adapter, "processes", lambda: [])
     result = adapter.stop(owned=False)
     assert result["ok"] is True
-    assert calls == [("server", "stop"), ("daemon", "down")]
+    assert calls == [
+        ("unload", "--all"),
+        ("ps", "--json"),
+        ("server", "stop"),
+        ("daemon", "down"),
+    ]
+
+
+def test_lm_studio_stop_kills_lingering_model_worker_but_keeps_service(
+    tmp_path, monkeypatch
+):
+    config = _config(
+        tmp_path,
+        provider="lm-studio",
+        upstream_url="http://127.0.0.1:65527",
+        allow_external_stop=True,
+        force_app_exit=False,
+    )
+    adapter = runtime.LMStudioAdapter(config, env={})
+    calls = []
+    worker_present = {"value": True}
+    port_open = {"value": True}
+    windows = runtime.platform_id() == "windows"
+    service = {
+        "pid": 201,
+        "command": ("LM Studio.exe" if windows else
+                    "/Applications/LM Studio.app/Contents/MacOS/LM Studio --run-as-service"),
+    }
+    worker = {
+        "pid": 202,
+        "command": ("llama-server.exe" if windows else
+                    "/tmp/.lmstudio/extensions/backends/llama.cpp/llama-server --model x.gguf"),
+    }
+
+    def fake_lms(*args, timeout=60):
+        calls.append(args)
+        if args == ("server", "stop"):
+            port_open["value"] = False
+        stdout = "[]" if args == ("ps", "--json") else ""
+        return runtime.subprocess.CompletedProcess(args, 0, stdout, "")
+
+    def fake_processes():
+        return [service, worker] if worker_present["value"] else [service]
+
+    def fake_terminate(**_kwargs):
+        worker_present["value"] = False
+        return {"attempted": True, "pids": [202], "remaining": []}
+
+    monkeypatch.setattr(adapter, "_lms", fake_lms)
+    monkeypatch.setattr(adapter, "healthy", lambda: False)
+    monkeypatch.setattr(
+        runtime, "port_is_open", lambda *_args, **_kwargs: port_open["value"]
+    )
+    monkeypatch.setattr(adapter, "processes", fake_processes)
+    monkeypatch.setattr(runtime, "terminate_lm_studio_model_processes", fake_terminate)
+    result = adapter.stop(owned=False)
+    assert result["ok"] is True
+    assert result["forced_model_exit"]["pids"] == [202]
+    assert adapter.processes() == [service]
 
 
 def test_render_handoff_stops_backend_and_uses_one_token(tmp_path):
@@ -582,6 +719,44 @@ def test_prompt_terminal_holds_lock_when_comfyui_unreachable(tmp_path, monkeypat
     monkeypatch.setattr(gateway, "_json_url", lambda url, timeout=2.0: None)
     coordinator.monitor_once()
     assert coordinator.render_lock() is not None
+
+
+def test_unreachable_comfyui_releases_orphan_lock_after_grace(
+        tmp_path, monkeypatch):
+    adapter = FakeAdapter(True)
+    coordinator = gateway.Coordinator(
+        _config(tmp_path, orphan_render_grace_seconds=15), adapter=adapter)
+    prepared = coordinator.prepare_render({"job_id": "job-dead-comfyui"})
+    coordinator.commit_render({"token": prepared["token"], "prompt_id": "p"})
+    monkeypatch.setattr(gateway, "_json_url", lambda url, timeout=2.0: None)
+    monkeypatch.setattr(gateway, "port_is_open", lambda *args, **kwargs: False)
+
+    coordinator.monitor_once()
+    assert coordinator.render_lock() is not None
+    with coordinator._render_lock_guard:
+        coordinator._render_lock["comfyui_unreachable_since"] -= 20
+    coordinator.monitor_once()
+
+    assert coordinator.render_lock() is None
+    assert coordinator.status()["events"][-1]["reason"] == "comfyui_unreachable"
+
+
+def test_unresponsive_but_open_comfyui_keeps_render_lock(
+        tmp_path, monkeypatch):
+    coordinator = gateway.Coordinator(
+        _config(tmp_path, orphan_render_grace_seconds=1),
+        adapter=FakeAdapter(True))
+    prepared = coordinator.prepare_render({"job_id": "job-busy-comfyui"})
+    coordinator.commit_render({"token": prepared["token"], "prompt_id": "p"})
+    monkeypatch.setattr(gateway, "_json_url", lambda url, timeout=2.0: None)
+    monkeypatch.setattr(gateway, "port_is_open", lambda *args, **kwargs: True)
+
+    with coordinator._render_lock_guard:
+        coordinator._render_lock["comfyui_unreachable_since"] = time.time() - 30
+    coordinator.monitor_once()
+
+    assert coordinator.render_lock() is not None
+    assert "comfyui_unreachable_since" not in coordinator.render_lock()
 
 
 def test_prompt_terminal_distinguishes_absent_from_unknown(tmp_path, monkeypatch):

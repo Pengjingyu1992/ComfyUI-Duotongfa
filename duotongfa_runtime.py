@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 
 PROJECT_ID = "duotongfa"
 PROJECT_NAME = "多通阀"
-RUNTIME_VERSION = "0.2.4"
+RUNTIME_VERSION = "0.2.5"
 SUPPORTED_PROVIDERS = (
     "lm-studio",
     "ollama",
@@ -273,6 +273,23 @@ def matching_processes(
     return rows
 
 
+def redact_process_command(command: str) -> str:
+    """Hide command-line credentials before status or log serialization."""
+    value = str(command or "")
+    secret_flags = r"api-key|api_key|token|access-token|password|secret"
+    value = re.sub(
+        rf"(?i)(--(?:{secret_flags})=)([^\s]+)",
+        r"\1[REDACTED]",
+        value,
+    )
+    value = re.sub(
+        rf"(?i)(--(?:{secret_flags})\s+)([^\s]+)",
+        r"\1[REDACTED]",
+        value,
+    )
+    return value
+
+
 def lm_studio_processes(*, system: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return LM Studio-owned processes without matching gateways/proxies.
 
@@ -308,7 +325,46 @@ def lm_studio_processes(*, system: Optional[str] = None) -> List[Dict[str, Any]]
         elif current == "linux":
             matched = matched or executable in {"lm-studio", "lmstudio"}
         if matched:
-            rows.append({"pid": pid, "command": command})
+            rows.append({"pid": pid, "command": redact_process_command(command)})
+    return rows
+
+
+def lm_studio_model_processes(
+    processes: Optional[Sequence[Mapping[str, Any]]] = None,
+    *,
+    system: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return only LM Studio processes that can retain a loaded model.
+
+    The desktop/service process is intentionally allowed to stay resident for
+    a fast next start. Render handoff must still wait for backend workers such
+    as ``llama-server`` to disappear; those workers own the model allocation.
+    """
+    current = platform_id(system)
+    candidates = list(processes) if processes is not None else lm_studio_processes(
+        system=current
+    )
+    rows: List[Dict[str, Any]] = []
+    for item in candidates:
+        command = str(item.get("command") or item.get("name") or "").strip()
+        raw_executable = command.strip('"')
+        executable_source = (
+            raw_executable
+            if current == "windows"
+            else raw_executable.split(" ", 1)[0]
+        )
+        executable = Path(executable_source).name.lower()
+        normalized = command.lower().replace("\\", "/")
+        is_worker = (
+            executable in {"llama-server", "llama-server.exe"}
+            or "llmster" in normalized
+            or (
+                "/.lmstudio/extensions/backends/vendor/_amphibian/" in normalized
+                and executable.startswith("python")
+            )
+        )
+        if is_worker:
+            rows.append(dict(item))
     return rows
 
 
@@ -345,6 +401,43 @@ def terminate_lm_studio_processes(*, timeout: float = 5.0,
                 pass
         time.sleep(0.25)
         remaining = lm_studio_processes(system=current)
+    return {"attempted": True, "pids": attempted, "remaining": remaining}
+
+
+def terminate_lm_studio_model_processes(
+    *, timeout: float = 5.0, system: Optional[str] = None
+) -> Dict[str, Any]:
+    """Terminate model workers while leaving the lightweight app/service alive."""
+    current = platform_id(system)
+    targets = lm_studio_model_processes(system=current)
+    if not targets:
+        return {"attempted": False, "remaining": []}
+    attempted: List[int] = []
+    for item in targets:
+        pid = int(item.get("pid") or 0)
+        if pid <= 0:
+            continue
+        attempted.append(pid)
+        try:
+            if current == "windows":
+                _run(["taskkill", "/PID", str(pid), "/T", "/F"], timeout=10.0)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except (OSError, RuntimeError):
+            pass
+    deadline = time.monotonic() + max(0.0, timeout)
+    remaining = lm_studio_model_processes(system=current)
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.25)
+        remaining = lm_studio_model_processes(system=current)
+    if remaining and current != "windows":
+        for item in remaining:
+            try:
+                os.kill(int(item.get("pid") or 0), signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(0.25)
+        remaining = lm_studio_model_processes(system=current)
     return {"attempted": True, "pids": attempted, "remaining": remaining}
 
 
@@ -662,6 +755,9 @@ class LMStudioAdapter(BackendAdapter):
     def processes(self) -> List[Dict[str, Any]]:
         return lm_studio_processes()
 
+    def model_processes(self) -> List[Dict[str, Any]]:
+        return lm_studio_model_processes(self.processes())
+
     def _loaded_models(self) -> List[Dict[str, Any]]:
         result = self._lms("ps", "--json", timeout=30.0)
         if result.returncode != 0:
@@ -792,7 +888,9 @@ class LMStudioAdapter(BackendAdapter):
 
     def stop(self, *, owned: bool) -> Dict[str, Any]:
         host, port = endpoint_host_port(self.config.upstream_url)
-        if not self.healthy() and not port_is_open(host, port):
+        healthy = self.healthy()
+        open_port = port_is_open(host, port)
+        if not healthy and not open_port and not self.model_processes():
             if not self.config.require_process_exit or not self.processes():
                 return {"ok": True, "already_off": True}
         if not owned and not self.config.allow_external_stop:
@@ -803,27 +901,48 @@ class LMStudioAdapter(BackendAdapter):
             }
         if self.config.stop_command:
             return super().stop(owned=owned)
-        # `server stop` unloads the active model. Calling `lms unload --all`
-        # first can wake the LM Studio desktop when no model is loaded and may
-        # spend a full CLI timeout doing so, defeating the render handoff.
+        # LM Studio 0.4.x may close the API server while leaving llama-server
+        # (and its model allocation) alive. Unload only while the backend is
+        # already online so this command cannot wake a cold desktop.
+        unload = None
+        loaded_after_unload: List[Dict[str, Any]] = []
+        if healthy or open_port:
+            unload = self._lms("unload", "--all", timeout=90.0)
+            if unload.returncode == 0:
+                try:
+                    loaded_after_unload = self._loaded_models()
+                except RuntimeError:
+                    # The server may finish stopping between the unload and
+                    # verification calls. Process release remains the final,
+                    # non-waking gate below.
+                    loaded_after_unload = []
         server = self._lms("server", "stop", timeout=30.0)
         app_before_daemon = self._quit_app()
         daemon = self._lms("daemon", "down", timeout=30.0)
         # Some LM Studio desktop builds reopen while `daemon down` reconciles
-        # its service. Quit once more after the final LMS command, then use a
-        # PID-scoped fallback only when strict application exit was requested.
+        # its service. Quit once more after the final LMS command. Always clear
+        # model workers; full application termination remains an opt-in strict
+        # mode so the lightweight service can start quickly.
         app_after_daemon = self._quit_app()
+        model_forced = {"attempted": False, "remaining": []}
+        if self.model_processes():
+            model_forced = terminate_lm_studio_model_processes(timeout=5.0)
         forced = {"attempted": False}
         if self.config.force_app_exit and self.processes():
             forced = terminate_lm_studio_processes(timeout=5.0)
         details = {
+            "unload_returncode": unload.returncode if unload is not None else None,
+            "loaded_models_after_unload": loaded_after_unload,
             "server_returncode": server.returncode,
             "daemon_returncode": daemon.returncode,
             "app_exit_before_daemon": app_before_daemon,
             "app_exit_after_daemon": app_after_daemon,
+            "forced_model_exit": model_forced,
             "forced_process_exit": forced,
         }
-        if self.healthy():
+        remaining_model_processes = self.model_processes()
+        if self.healthy() or port_is_open(host, port) or remaining_model_processes:
+            details["model_processes"] = remaining_model_processes
             details.update({"ok": False, "reason": "backend_still_healthy"})
             return details
         details["ok"] = True
@@ -834,6 +953,7 @@ class LMStudioAdapter(BackendAdapter):
         result.update({
             "lms_path": str(self.lms_path) if self.lms_path else "",
             "force_app_exit": self.config.force_app_exit,
+            "model_processes": lm_studio_model_processes(result.get("processes") or []),
         })
         return result
 
@@ -851,14 +971,23 @@ def release_ready(
     backend = adapter.status()
     memory = memory_snapshot()
     processes = backend.get("processes") or []
+    model_processes = backend.get("model_processes")
+    if model_processes is None and str(backend.get("provider") or "") == "lm-studio":
+        model_processes = lm_studio_model_processes(processes)
+    model_processes = model_processes or []
     available = int(memory.get("available_bytes") or 0)
     minimum = int(config.minimum_available_mb) * 1024 * 1024
     ready = not backend.get("healthy") and not backend.get("port_open")
+    ready = ready and not model_processes
     if config.require_process_exit:
         ready = ready and not processes
     if minimum:
         ready = ready and available >= minimum
-    return ready, {"backend": backend, "memory": memory}
+    return ready, {
+        "backend": backend,
+        "memory": memory,
+        "model_processes": model_processes,
+    }
 
 
 def wait_for_release(

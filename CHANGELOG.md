@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.5
+
+- Verify that LM Studio model workers have exited before allowing rendering, including workers left behind after the API server stops.
+- Redact credential flags from LM Studio process-command diagnostics.
+- Recover orphan render locks after ComfyUI stops, while preserving the lock when its port remains open but HTTP is unresponsive.
+- Replace deployment-specific hardware, benchmark, and model examples with generic documentation.
+- Extend the release privacy audit to Git metadata and distribution contents.
+
 ## 0.2.4
 
 - Added model-aware cold-load and model-switch coordination while preserving warm same-model concurrency.
